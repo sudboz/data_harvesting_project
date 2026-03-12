@@ -1,0 +1,1502 @@
+---
+title: "tripadvisor_scrape"
+output: html_document
+date: "2026-03-11"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## LIBRARIES
+
+```{r}
+library(httr2)
+library(rvest)
+library(dplyr)
+library(stringr)
+library(readr)
+library(jsonlite)
+```
+
+## DATADOME CONFIGURATION
+
+```{r}
+DATADOME <- "c9iIGWtf~5epnoBulF3r65aI9IN9q1QSYNqIbI5EODAXFNPViNjoU38iOWzGfVADAkJM8JnEgq~c6Q9y4iWEjaZzKdUvbs~ZSV5DaYndiMWu2DywNG7O6Kz4zpZ8WKr8"
+```
+
+
+## RESTAURANTS SCRAPING
+
+### MADRID
+
+```{r}
+URL_MAD <- "https://www.tripadvisor.com/Restaurants-g187514-oa{offset}-Madrid.html"
+
+
+# GET function
+
+get_html_mad <- function(url) {
+  request(url) |>
+    req_method("GET") |>
+    req_headers(
+      "accept"          = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+      "accept-encoding" = "gzip, deflate",
+      "accept-language" = "es-ES,es;q=0.9",
+      "user-agent"      = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36",
+      "referer"         = "https://www.tripadvisor.com/Restaurants-g187514-Madrid.html",
+      "cookie"          = paste0("datadome=", DATADOME)
+    ) |>
+    req_error(is_error = \(resp) FALSE) |>
+    req_perform() |>
+    resp_body_string() |>
+    read_html()
+}
+
+
+# Fetch total
+
+get_total_mad <- function() {
+  message("Fetching total restaurant count for Madrid...")
+
+  page <- get_html_mad(str_replace(URL_MAD, "\\{offset\\}", "0"))
+
+  total_text <- page |>
+    html_elements("span, div") |>
+    html_text(trim = TRUE) |>
+    (\(x) x[str_detect(x, "^[\\d,]+ results")])() |>
+    first()
+
+  total <- total_text |>
+    str_extract("^[\\d,]+") |>
+    str_remove_all(",") |>
+    as.integer()
+
+  if (is.na(total)) stop("Could not retrieve total - check that DATADOME is valid")
+
+  message("Total: ", total, " restaurants (~", ceiling(total / 30), " pages)")
+  total
+}
+
+TOTAL_MAD <- get_total_mad()
+
+
+# Parse cards
+
+parse_page_mad <- function(page) {
+  cards <- page |> html_elements('[data-automation="restaurantCard"]')
+  if (length(cards) == 0) return(NULL)
+
+  lapply(cards, function(card) {
+    url          <- card |> html_element('a[href*="Restaurant_Review"]') |> html_attr("href")
+    full_url     <- paste0("https://www.tripadvisor.com", url)
+    location_id  <- str_extract(url, "(?<=-d)\\d+")
+    name         <- url |>
+      str_extract("(?<=Reviews-).*(?=-Madrid)") |>
+      str_replace_all("_", " ")
+    rating       <- card |>
+      html_element('[data-automation="bubbleRatingValue"]') |>
+      html_text(trim = TRUE)
+    review_count <- card |>
+      html_element('[data-automation="bubbleReviewCount"]') |>
+      html_text(trim = TRUE) |>
+      str_remove_all("[^0-9]")
+    texts        <- card |> html_elements("span") |> html_text(trim = TRUE)
+    cuisine      <- texts[!str_detect(texts, "^[0-9]") &
+                          !str_detect(texts, "\\$") &
+                          !str_detect(texts, "reviews") &
+                          !str_detect(texts, "^\\s*$") &
+                          nchar(texts) > 2] |> first()
+    price_range  <- texts[str_detect(texts, "\\$")] |> first()
+
+    data.frame(
+      location_id, name, rating,
+      review_count, cuisine, price_range,
+      url = full_url,
+      stringsAsFactors = FALSE
+    )
+  }) |> bind_rows()
+}
+
+
+# Main loop
+
+offsets_mad      <- seq(0, TOTAL_MAD - 1, by = 30)
+results_mad      <- list()
+failed_pages_mad <- c()
+
+message("Starting scrape: ", length(offsets_mad), " pages")
+
+for (i in seq_along(offsets_mad)) {
+
+  offset <- offsets_mad[i]
+  message("[", i, "/", length(offsets_mad), "] Offset ", offset)
+
+  page_html <- tryCatch(
+    get_html_mad(str_replace(URL_MAD, "\\{offset\\}", as.character(offset))),
+    error = function(e) {
+      warning("Error at offset ", offset, ": ", e$message)
+      NULL
+    }
+  )
+
+  if (!is.null(page_html)) {
+    df_page <- parse_page_mad(page_html)
+
+    if (!is.null(df_page) && nrow(df_page) > 0) {
+      results_mad[[i]] <- df_page
+      message("  ", nrow(df_page), " restaurants | Running total: ",
+              sum(sapply(results_mad, function(x) if (!is.null(x)) nrow(x) else 0)))
+    } else {
+      message("  No cards found - possible block at offset ", offset)
+      failed_pages_mad <- c(failed_pages_mad, offset)
+    }
+  } else {
+    failed_pages_mad <- c(failed_pages_mad, offset)
+  }
+
+  if (i %% 10 == 0) {
+    checkpoint <- bind_rows(results_mad)
+    write_csv(checkpoint, paste0("checkpoint_mad_", i, ".csv"), na = "")
+    message("  Checkpoint saved: ", nrow(checkpoint), " restaurants")
+  }
+
+  Sys.sleep(3)
+}
+
+
+# Retry failed pages
+
+if (length(failed_pages_mad) > 0) {
+  message("Retrying ", length(failed_pages_mad), " failed pages...")
+  Sys.sleep(10)
+
+  for (offset in failed_pages_mad) {
+    message("Retrying offset ", offset)
+
+    page_html <- tryCatch(
+      get_html_mad(str_replace(URL_MAD, "\\{offset\\}", as.character(offset))),
+      error = function(e) NULL
+    )
+
+    if (!is.null(page_html)) {
+      df_page <- parse_page_mad(page_html)
+      if (!is.null(df_page) && nrow(df_page) > 0) {
+        idx <- which(offsets_mad == offset)
+        results_mad[[idx]] <- df_page
+        message("  Recovered: ", nrow(df_page), " restaurants")
+      }
+    }
+    Sys.sleep(5)
+  }
+}
+
+
+# Save final CSV
+
+final_catalog_mad <- bind_rows(results_mad) |>
+  distinct(location_id, .keep_all = TRUE) |>
+  arrange(as.numeric(location_id))
+
+message("Total unique restaurants (Madrid): ", nrow(final_catalog_mad))
+
+write_csv(final_catalog_mad, "restaurants_madrid_tripadvisor.csv", na = "")
+message("Final CSV saved: restaurants_madrid_tripadvisor.csv")
+
+```
+
+
+### SEVILLE
+
+```{r}
+URL_SEV <- "https://www.tripadvisor.com/Restaurants-g187443-oa{offset}-Seville_Province_of_Seville_Andalucia.html"
+
+
+# GET function
+
+get_html_sev <- function(url) {
+  request(url) |>
+    req_method("GET") |>
+    req_headers(
+      "accept"          = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+      "accept-encoding" = "gzip, deflate",
+      "accept-language" = "es-ES,es;q=0.9",
+      "user-agent"      = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36",
+      "referer"         = "https://www.tripadvisor.com/Restaurants-g187443-Seville_Province_of_Seville_Andalucia.html",
+      "cookie"          = paste0("datadome=", DATADOME)
+    ) |>
+    req_error(is_error = \(resp) FALSE) |>
+    req_perform() |>
+    resp_body_string() |>
+    read_html()
+}
+
+
+# Fetch total
+
+get_total_sev <- function() {
+  message("Fetching total restaurant count for Seville...")
+
+  page <- get_html_sev(str_replace(URL_SEV, "\\{offset\\}", "0"))
+
+  total_text <- page |>
+    html_elements("span, div") |>
+    html_text(trim = TRUE) |>
+    (\(x) x[str_detect(x, "^[\\d,]+ results")])() |>
+    first()
+
+  total <- total_text |>
+    str_extract("^[\\d,]+") |>
+    str_remove_all(",") |>
+    as.integer()
+
+  if (is.na(total)) stop("Could not retrieve total - check that DATADOME is valid")
+
+  message("Total: ", total, " restaurants (~", ceiling(total / 30), " pages)")
+  total
+}
+
+TOTAL_SEV <- get_total_sev()
+
+
+# Parse cards
+
+parse_page_sev <- function(page) {
+  cards <- page |> html_elements('[data-automation="restaurantCard"]')
+  if (length(cards) == 0) return(NULL)
+
+  lapply(cards, function(card) {
+    url          <- card |> html_element('a[href*="Restaurant_Review"]') |> html_attr("href")
+    full_url     <- paste0("https://www.tripadvisor.com", url)
+    location_id  <- str_extract(url, "(?<=-d)\\d+")
+    name         <- url |>
+      str_extract("(?<=Reviews-).*(?=-Seville)") |>
+      str_replace_all("_", " ")
+    rating       <- card |>
+      html_element('[data-automation="bubbleRatingValue"]') |>
+      html_text(trim = TRUE)
+    review_count <- card |>
+      html_element('[data-automation="bubbleReviewCount"]') |>
+      html_text(trim = TRUE) |>
+      str_remove_all("[^0-9]")
+    texts        <- card |> html_elements("span") |> html_text(trim = TRUE)
+    cuisine      <- texts[!str_detect(texts, "^[0-9]") &
+                          !str_detect(texts, "\\$") &
+                          !str_detect(texts, "reviews") &
+                          !str_detect(texts, "^\\s*$") &
+                          nchar(texts) > 2] |> first()
+    price_range  <- texts[str_detect(texts, "\\$")] |> first()
+
+    data.frame(
+      location_id, name, rating,
+      review_count, cuisine, price_range,
+      url = full_url,
+      stringsAsFactors = FALSE
+    )
+  }) |> bind_rows()
+}
+
+
+# Main loop
+
+offsets_sev      <- seq(0, TOTAL_SEV - 1, by = 30)
+results_sev      <- list()
+failed_pages_sev <- c()
+
+message("Starting scrape: ", length(offsets_sev), " pages")
+
+for (i in seq_along(offsets_sev)) {
+
+  offset <- offsets_sev[i]
+  message("[", i, "/", length(offsets_sev), "] Offset ", offset)
+
+  page_html <- tryCatch(
+    get_html_sev(str_replace(URL_SEV, "\\{offset\\}", as.character(offset))),
+    error = function(e) {
+      warning("Error at offset ", offset, ": ", e$message)
+      NULL
+    }
+  )
+
+  if (!is.null(page_html)) {
+    df_page <- parse_page_sev(page_html)
+
+    if (!is.null(df_page) && nrow(df_page) > 0) {
+      results_sev[[i]] <- df_page
+      message("  ", nrow(df_page), " restaurants | Running total: ",
+              sum(sapply(results_sev, function(x) if (!is.null(x)) nrow(x) else 0)))
+    } else {
+      message("  No cards found - possible block at offset ", offset)
+      failed_pages_sev <- c(failed_pages_sev, offset)
+    }
+  } else {
+    failed_pages_sev <- c(failed_pages_sev, offset)
+  }
+
+  if (i %% 10 == 0) {
+    checkpoint <- bind_rows(results_sev)
+    write_csv(checkpoint, paste0("checkpoint_sev_", i, ".csv"), na = "")
+    message("  Checkpoint saved: ", nrow(checkpoint), " restaurants")
+  }
+
+  Sys.sleep(3)
+}
+
+
+# Retry failed pages
+
+if (length(failed_pages_sev) > 0) {
+  message("Retrying ", length(failed_pages_sev), " failed pages...")
+  Sys.sleep(10)
+
+  for (offset in failed_pages_sev) {
+    message("Retrying offset ", offset)
+
+    page_html <- tryCatch(
+      get_html_sev(str_replace(URL_SEV, "\\{offset\\}", as.character(offset))),
+      error = function(e) NULL
+    )
+
+    if (!is.null(page_html)) {
+      df_page <- parse_page_sev(page_html)
+      if (!is.null(df_page) && nrow(df_page) > 0) {
+        idx <- which(offsets_sev == offset)
+        results_sev[[idx]] <- df_page
+        message("  Recovered: ", nrow(df_page), " restaurants")
+      }
+    }
+    Sys.sleep(5)
+  }
+}
+
+
+# Save final CSV
+
+final_catalog_sev <- bind_rows(results_sev) |>
+  distinct(location_id, .keep_all = TRUE) |>
+  arrange(as.numeric(location_id))
+
+message("Total unique restaurants (Seville): ", nrow(final_catalog_sev))
+
+write_csv(final_catalog_sev, "restaurants_seville_tripadvisor.csv", na = "")
+message("Final CSV saved: restaurants_seville_tripadvisor.csv")
+
+
+```
+
+
+### BARCELONA
+
+```{r}
+URL_BCN <- "https://www.tripadvisor.com/Restaurants-g187497-oa{offset}-Barcelona_Catalonia.html"
+
+
+# GET function
+
+get_html_bcn <- function(url) {
+  request(url) |>
+    req_method("GET") |>
+    req_headers(
+      "accept"          = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+      "accept-encoding" = "gzip, deflate",
+      "accept-language" = "es-ES,es;q=0.9",
+      "user-agent"      = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36",
+      "referer"         = "https://www.tripadvisor.com/Restaurants-g187497-Barcelona_Catalonia.html",
+      "cookie"          = paste0("datadome=", DATADOME)
+    ) |>
+    req_error(is_error = \(resp) FALSE) |>
+    req_perform() |>
+    resp_body_string() |>
+    read_html()
+}
+
+
+# Fetch total
+
+get_total_bcn <- function() {
+  message("Fetching total restaurant count for Barcelona...")
+
+  page <- get_html_bcn(str_replace(URL_BCN, "\\{offset\\}", "0"))
+
+  total_text <- page |>
+    html_elements("span, div") |>
+    html_text(trim = TRUE) |>
+    (\(x) x[str_detect(x, "^[\\d,]+ results")])() |>
+    first()
+
+  total <- total_text |>
+    str_extract("^[\\d,]+") |>
+    str_remove_all(",") |>
+    as.integer()
+
+  if (is.na(total)) stop("Could not retrieve total - check that DATADOME is valid")
+
+  message("Total: ", total, " restaurants (~", ceiling(total / 30), " pages)")
+  total
+}
+
+TOTAL_BCN <- get_total_bcn()
+
+
+# Parse cards
+
+parse_page_bcn <- function(page) {
+  cards <- page |> html_elements('[data-automation="restaurantCard"]')
+  if (length(cards) == 0) return(NULL)
+
+  lapply(cards, function(card) {
+    url          <- card |> html_element('a[href*="Restaurant_Review"]') |> html_attr("href")
+    full_url     <- paste0("https://www.tripadvisor.com", url)
+    location_id  <- str_extract(url, "(?<=-d)\\d+")
+    name         <- url |>
+      str_extract("(?<=Reviews-).*(?=-Barcelona)") |>
+      str_replace_all("_", " ")
+    rating       <- card |>
+      html_element('[data-automation="bubbleRatingValue"]') |>
+      html_text(trim = TRUE)
+    review_count <- card |>
+      html_element('[data-automation="bubbleReviewCount"]') |>
+      html_text(trim = TRUE) |>
+      str_remove_all("[^0-9]")
+    texts        <- card |> html_elements("span") |> html_text(trim = TRUE)
+    cuisine      <- texts[!str_detect(texts, "^[0-9]") &
+                          !str_detect(texts, "\\$") &
+                          !str_detect(texts, "reviews") &
+                          !str_detect(texts, "^\\s*$") &
+                          nchar(texts) > 2] |> first()
+    price_range  <- texts[str_detect(texts, "\\$")] |> first()
+
+    data.frame(
+      location_id, name, rating,
+      review_count, cuisine, price_range,
+      url = full_url,
+      stringsAsFactors = FALSE
+    )
+  }) |> bind_rows()
+}
+
+
+# Main loop
+
+offsets_bcn      <- seq(0, TOTAL_BCN - 1, by = 30)
+results_bcn      <- list()
+failed_pages_bcn <- c()
+
+message("Starting scrape: ", length(offsets_bcn), " pages")
+
+for (i in seq_along(offsets_bcn)) {
+
+  offset <- offsets_bcn[i]
+  message("[", i, "/", length(offsets_bcn), "] Offset ", offset)
+
+  page_html <- tryCatch(
+    get_html_bcn(str_replace(URL_BCN, "\\{offset\\}", as.character(offset))),
+    error = function(e) {
+      warning("Error at offset ", offset, ": ", e$message)
+      NULL
+    }
+  )
+
+  if (!is.null(page_html)) {
+    df_page <- parse_page_bcn(page_html)
+
+    if (!is.null(df_page) && nrow(df_page) > 0) {
+      results_bcn[[i]] <- df_page
+      message("  ", nrow(df_page), " restaurants | Running total: ",
+              sum(sapply(results_bcn, function(x) if (!is.null(x)) nrow(x) else 0)))
+    } else {
+      message("  No cards found - possible block at offset ", offset)
+      failed_pages_bcn <- c(failed_pages_bcn, offset)
+    }
+  } else {
+    failed_pages_bcn <- c(failed_pages_bcn, offset)
+  }
+
+  if (i %% 10 == 0) {
+    checkpoint <- bind_rows(results_bcn)
+    write_csv(checkpoint, paste0("checkpoint_bcn_", i, ".csv"), na = "")
+    message("  Checkpoint saved: ", nrow(checkpoint), " restaurants")
+  }
+
+  Sys.sleep(3)
+}
+
+
+# Retry failed pages
+
+if (length(failed_pages_bcn) > 0) {
+  message("Retrying ", length(failed_pages_bcn), " failed pages...")
+  Sys.sleep(10)
+
+  for (offset in failed_pages_bcn) {
+    message("Retrying offset ", offset)
+
+    page_html <- tryCatch(
+      get_html_bcn(str_replace(URL_BCN, "\\{offset\\}", as.character(offset))),
+      error = function(e) NULL
+    )
+
+    if (!is.null(page_html)) {
+      df_page <- parse_page_bcn(page_html)
+      if (!is.null(df_page) && nrow(df_page) > 0) {
+        idx <- which(offsets_bcn == offset)
+        results_bcn[[idx]] <- df_page
+        message("  Recovered: ", nrow(df_page), " restaurants")
+      }
+    }
+    Sys.sleep(5)
+  }
+}
+
+
+# Save final CSV
+
+# Removing duplicated observations
+final_catalog_bcn <- bind_rows(results_bcn) |>
+  distinct(location_id, .keep_all = TRUE) |>
+  arrange(as.numeric(location_id))
+
+message("Total unique restaurants (Barcelona): ", nrow(final_catalog_bcn))
+
+write_csv(final_catalog_bcn, "restaurants_barcelona_tripadvisor.csv", na = "")
+message("Final CSV saved: restaurants_barcelona_tripadvisor.csv")
+
+print(head(final_catalog_bcn, 10))
+```
+
+
+## ATTRACTIONS AND ACTIVITIES SCRAPING
+
+
+```{r}
+BOOKING_KEYS <- c("Admission Tickets Available", "Likely to Sell Out", "Book in Advance")
+OPEN_KEYS    <- c("Open now", "Closed now", "Temporarily closed")
+```
+
+### MADRID
+
+```{r}
+URL_ATR_MAD <- "https://www.tripadvisor.com/Attractions-g187514-Activities-oa{offset}-Madrid.html"
+
+# GET function
+
+get_html_atr_mad <- function(url) {
+  request(url) |>
+    req_method("GET") |>
+    req_headers(
+      "accept"          = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+      "accept-encoding" = "gzip, deflate",
+      "accept-language" = "es-ES,es;q=0.9",
+      "user-agent"      = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36",
+      "referer"         = "https://www.tripadvisor.com/Attractions-g187514-Activities-Madrid.html",
+      "cookie"          = paste0("datadome=", DATADOME)
+    ) |>
+    req_error(is_error = \(resp) FALSE) |>
+    req_perform() |>
+    resp_body_string() |>
+    read_html()
+}
+
+
+# Extract metadata from card
+
+extract_meta_atr <- function(card) {
+  texts <- card |>
+    html_elements("div.biGQs.VImYz") |>
+    html_text2()
+  
+  texts <- texts[!duplicated(texts)]
+  texts <- texts[!str_detect(texts, "^\\d\\.\\d$") &
+                   !str_detect(texts, "^\\(\\d[\\d,]+\\)$") &
+                   nchar(texts) <= 80]
+  
+  category     <- if (length(texts) >= 1) texts[1] else NA_character_
+  raw_nb       <- if (length(texts) >= 2) texts[2] else NA_character_
+  is_nb_status <- !is.na(raw_nb) && (raw_nb %in% BOOKING_KEYS || raw_nb %in% OPEN_KEYS)
+  neighborhood <- if (is_nb_status) NA_character_ else raw_nb
+  
+  rest_start <- if (is_nb_status) 2L else 3L
+  rest       <- if (length(texts) >= rest_start) texts[rest_start:length(texts)] else character(0)
+  
+  open_raw    <- rest[rest %in% OPEN_KEYS | str_detect(rest, "Temporarily closed")]
+  open_status <- if (length(open_raw)) str_remove(open_raw[1], "^-\\s*") else NA_character_
+  
+  booking_raw       <- rest[rest %in% BOOKING_KEYS]
+  booking_available <- if (length(booking_raw)) booking_raw[1] else NA_character_
+  
+  list(
+    category          = category,
+    neighborhood      = neighborhood,
+    open_status       = open_status,
+    booking_available = booking_available
+  )
+}
+
+
+# Parse cards
+
+parse_page_atr_mad <- function(page, global_start) {
+  cards <- page |> html_elements('[data-automation="cardWrapper"]')
+  if (length(cards) == 0) return(NULL)
+  
+  lapply(seq_along(cards), function(i) {
+    card <- cards[[i]]
+    
+    tracking      <- card |> html_attr("data-tracking-title")
+    attraction_id <- str_extract(tracking, "(?<=attraction_)\\d+")
+    
+    name_el <- card |> html_element(".XfVdV")
+    name    <- if (!is.na(name_el)) {
+      name_el |> html_text2() |> str_remove("^\\d+\\.") |> str_trim()
+    } else NA_character_
+    
+    link     <- card |> html_element("a[href*='Attraction_Review']")
+    url_raw  <- if (!is.na(link)) html_attr(link, "href") else NA_character_
+    full_url <- if (!is.na(url_raw) && !str_starts(url_raw, "http")) {
+      paste0("https://www.tripadvisor.com", url_raw)
+    } else url_raw
+    
+    rating <- card |>
+      html_element('[data-automation="bubbleRatingValue"]') |>
+      html_text2() |>
+      as.numeric()
+    
+    review_count <- card |>
+      html_element('[data-automation="bubbleReviewCount"]') |>
+      html_text2() |>
+      str_remove_all("[^0-9]") |>
+      as.integer()
+    
+    tc_el            <- card |> html_element('[data-automation="travelersChoice-2025"]')
+    travelers_choice <- !is.na(tc_el)
+    
+    desc_el     <- card |> html_element('[data-automation="listCardDescription"]')
+    description <- if (!is.na(desc_el)) html_text2(desc_el) else NA_character_
+    
+    meta <- extract_meta_atr(card)
+    
+    data.frame(
+      rank              = global_start + i,
+      attraction_id,
+      name,
+      category          = meta$category,
+      neighborhood      = meta$neighborhood,
+      rating,
+      review_count,
+      travelers_choice,
+      open_status       = meta$open_status,
+      booking_available = meta$booking_available,
+      description,
+      url               = full_url,
+      stringsAsFactors  = FALSE
+    )
+  }) |> bind_rows()
+}
+
+
+# Main loop
+# Upper bound of 6000 is a safe ceiling - loop stops via break when no cards are found
+
+offsets_atr_mad      <- seq(0, 5999, by = 30)
+results_atr_mad      <- list()
+failed_pages_atr_mad <- c()
+global_count_mad     <- 0
+
+message("Starting scrape...")
+
+for (i in seq_along(offsets_atr_mad)) {
+  
+  offset <- offsets_atr_mad[i]
+  message("[", i, "] Offset ", offset)
+  
+  page_html <- tryCatch(
+    get_html_atr_mad(str_replace(URL_ATR_MAD, "\\{offset\\}", as.character(offset))),
+    error = function(e) {
+      warning("Error at offset ", offset, ": ", e$message)
+      NULL
+    }
+  )
+  
+  if (!is.null(page_html)) {
+    df_page <- parse_page_atr_mad(page_html, global_count_mad)
+    
+    if (!is.null(df_page) && nrow(df_page) > 0) {
+      results_atr_mad[[i]] <- df_page
+      global_count_mad     <- global_count_mad + nrow(df_page)
+      message("  ", nrow(df_page), " attractions | Running total: ", global_count_mad)
+    } else {
+      message("  No cards found at offset ", offset, " - stopping.")
+      break
+    }
+  } else {
+    failed_pages_atr_mad <- c(failed_pages_atr_mad, offset)
+  }
+  
+  if (i %% 10 == 0) {
+    checkpoint <- bind_rows(results_atr_mad)
+    write_csv(checkpoint, paste0("checkpoint_atr_mad_", i, ".csv"), na = "")
+    message("  Checkpoint saved: ", nrow(checkpoint), " attractions")
+  }
+  
+  Sys.sleep(3)
+}
+
+
+# Retry failed pages
+
+if (length(failed_pages_atr_mad) > 0) {
+  message("Retrying ", length(failed_pages_atr_mad), " failed pages...")
+  Sys.sleep(10)
+  
+  for (offset in failed_pages_atr_mad) {
+    message("Retrying offset ", offset)
+    
+    page_html <- tryCatch(
+      get_html_atr_mad(str_replace(URL_ATR_MAD, "\\{offset\\}", as.character(offset))),
+      error = function(e) NULL
+    )
+    
+    if (!is.null(page_html)) {
+      df_page <- parse_page_atr_mad(page_html, 0)
+      if (!is.null(df_page) && nrow(df_page) > 0) {
+        idx <- which(offsets_atr_mad == offset)
+        results_atr_mad[[idx]] <- df_page
+        message("  Recovered: ", nrow(df_page), " attractions")
+      }
+    }
+    Sys.sleep(5)
+  }
+}
+
+
+# Save final CSV
+
+final_catalog_atr_mad <- bind_rows(results_atr_mad) |>
+  distinct(attraction_id, .keep_all = TRUE) |>
+  arrange(rank)
+
+message("Total unique attractions (Madrid): ", nrow(final_catalog_atr_mad))
+
+write_csv(final_catalog_atr_mad, "attractions_madrid_tripadvisor.csv", na = "")
+message("Final CSV saved: attractions_madrid_tripadvisor.csv")
+```
+
+### SEVILLE
+
+```{r}
+URL_ATR_SEV <- "https://www.tripadvisor.com/Attractions-g187443-Activities-oa{offset}-Seville_Province_of_Seville_Andalucia.html"
+
+# GET function
+
+get_html_atr_sev <- function(url) {
+  request(url) |>
+    req_method("GET") |>
+    req_headers(
+      "accept"          = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+      "accept-encoding" = "gzip, deflate",
+      "accept-language" = "es-ES,es;q=0.9",
+      "user-agent"      = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36",
+      "referer"         = "https://www.tripadvisor.com/Attractions-g187443-Activities-Seville_Province_of_Seville_Andalucia.html",
+      "cookie"          = paste0("datadome=", DATADOME)
+    ) |>
+    req_error(is_error = \(resp) FALSE) |>
+    req_perform() |>
+    resp_body_string() |>
+    read_html()
+}
+
+
+# Extract metadata from card
+
+extract_meta_atr_sev <- function(card) {
+  texts <- card |>
+    html_elements("div.biGQs.VImYz") |>
+    html_text2()
+
+  texts <- texts[!duplicated(texts)]
+  texts <- texts[!str_detect(texts, "^\\d\\.\\d$") &
+                 !str_detect(texts, "^\\(\\d[\\d,]+\\)$") &
+                 nchar(texts) <= 80]
+
+  category     <- if (length(texts) >= 1) texts[1] else NA_character_
+  raw_nb       <- if (length(texts) >= 2) texts[2] else NA_character_
+  is_nb_status <- !is.na(raw_nb) && (raw_nb %in% BOOKING_KEYS || raw_nb %in% OPEN_KEYS)
+  neighborhood <- if (is_nb_status) NA_character_ else raw_nb
+
+  rest_start <- if (is_nb_status) 2L else 3L
+  rest       <- if (length(texts) >= rest_start) texts[rest_start:length(texts)] else character(0)
+
+  open_raw    <- rest[rest %in% OPEN_KEYS | str_detect(rest, "Temporarily closed")]
+  open_status <- if (length(open_raw)) str_remove(open_raw[1], "^-\\s*") else NA_character_
+
+  booking_raw       <- rest[rest %in% BOOKING_KEYS]
+  booking_available <- if (length(booking_raw)) booking_raw[1] else NA_character_
+
+  list(
+    category          = category,
+    neighborhood      = neighborhood,
+    open_status       = open_status,
+    booking_available = booking_available
+  )
+}
+
+
+# Parse cards
+
+parse_page_atr_sev <- function(page, global_start) {
+  cards <- page |> html_elements('[data-automation="cardWrapper"]')
+  if (length(cards) == 0) return(NULL)
+
+  lapply(seq_along(cards), function(i) {
+    card <- cards[[i]]
+
+    tracking      <- card |> html_attr("data-tracking-title")
+    attraction_id <- str_extract(tracking, "(?<=attraction_)\\d+")
+
+    name_el <- card |> html_element(".XfVdV")
+    name    <- if (!is.na(name_el)) {
+      name_el |> html_text2() |> str_remove("^\\d+\\.") |> str_trim()
+    } else NA_character_
+
+    link     <- card |> html_element("a[href*='Attraction_Review']")
+    url_raw  <- if (!is.na(link)) html_attr(link, "href") else NA_character_
+    full_url <- if (!is.na(url_raw) && !str_starts(url_raw, "http")) {
+      paste0("https://www.tripadvisor.com", url_raw)
+    } else url_raw
+
+    rating <- card |>
+      html_element('[data-automation="bubbleRatingValue"]') |>
+      html_text2() |>
+      as.numeric()
+
+    review_count <- card |>
+      html_element('[data-automation="bubbleReviewCount"]') |>
+      html_text2() |>
+      str_remove_all("[^0-9]") |>
+      as.integer()
+
+    tc_el            <- card |> html_element('[data-automation="travelersChoice-2025"]')
+    travelers_choice <- !is.na(tc_el)
+
+    desc_el     <- card |> html_element('[data-automation="listCardDescription"]')
+    description <- if (!is.na(desc_el)) html_text2(desc_el) else NA_character_
+
+    meta <- extract_meta_atr_sev(card)
+
+    data.frame(
+      rank              = global_start + i,
+      attraction_id,
+      name,
+      category          = meta$category,
+      neighborhood      = meta$neighborhood,
+      rating,
+      review_count,
+      travelers_choice,
+      open_status       = meta$open_status,
+      booking_available = meta$booking_available,
+      description,
+      url               = full_url,
+      stringsAsFactors  = FALSE
+    )
+  }) |> bind_rows()
+}
+
+
+# Main loop
+# Upper bound of 6000 is a safe ceiling - loop stops via break when no cards are found
+
+offsets_atr_sev      <- seq(0, 5999, by = 30)
+results_atr_sev      <- list()
+failed_pages_atr_sev <- c()
+global_count_sev     <- 0
+
+message("Starting scrape...")
+
+for (i in seq_along(offsets_atr_sev)) {
+
+  offset <- offsets_atr_sev[i]
+  message("[", i, "] Offset ", offset)
+
+  page_html <- tryCatch(
+    get_html_atr_sev(str_replace(URL_ATR_SEV, "\\{offset\\}", as.character(offset))),
+    error = function(e) {
+      warning("Error at offset ", offset, ": ", e$message)
+      NULL
+    }
+  )
+
+  if (!is.null(page_html)) {
+    df_page <- parse_page_atr_sev(page_html, global_count_sev)
+
+    if (!is.null(df_page) && nrow(df_page) > 0) {
+      results_atr_sev[[i]] <- df_page
+      global_count_sev     <- global_count_sev + nrow(df_page)
+      message("  ", nrow(df_page), " attractions | Running total: ", global_count_sev)
+    } else {
+      message("  No cards found at offset ", offset, " - stopping.")
+      break
+    }
+  } else {
+    failed_pages_atr_sev <- c(failed_pages_atr_sev, offset)
+  }
+
+  if (i %% 10 == 0) {
+    checkpoint <- bind_rows(results_atr_sev)
+    write_csv(checkpoint, paste0("checkpoint_atr_sev_", i, ".csv"), na = "")
+    message("  Checkpoint saved: ", nrow(checkpoint), " attractions")
+  }
+
+  Sys.sleep(3)
+}
+
+
+# Retry failed pages
+
+if (length(failed_pages_atr_sev) > 0) {
+  message("Retrying ", length(failed_pages_atr_sev), " failed pages...")
+  Sys.sleep(10)
+
+  for (offset in failed_pages_atr_sev) {
+    message("Retrying offset ", offset)
+
+    page_html <- tryCatch(
+      get_html_atr_sev(str_replace(URL_ATR_SEV, "\\{offset\\}", as.character(offset))),
+      error = function(e) NULL
+    )
+
+    if (!is.null(page_html)) {
+      df_page <- parse_page_atr_sev(page_html, 0)
+      if (!is.null(df_page) && nrow(df_page) > 0) {
+        idx <- which(offsets_atr_sev == offset)
+        results_atr_sev[[idx]] <- df_page
+        message("  Recovered: ", nrow(df_page), " attractions")
+      }
+    }
+    Sys.sleep(5)
+  }
+}
+
+
+# Save final CSV
+
+final_catalog_atr_sev <- bind_rows(results_atr_sev) |>
+  distinct(attraction_id, .keep_all = TRUE) |>
+  arrange(rank)
+
+message("Total unique attractions (Seville): ", nrow(final_catalog_atr_sev))
+
+write_csv(final_catalog_atr_sev, "attractions_seville_tripadvisor.csv", na = "")
+message("Final CSV saved: attractions_seville_tripadvisor.csv")
+
+```
+
+### BARCELONA
+
+```{r}
+URL_ATR_BCN <- "https://www.tripadvisor.com/Attractions-g187497-Activities-oa{offset}-Barcelona_Catalonia.html"
+
+
+# GET function
+
+get_html_atr_bcn <- function(url) {
+  request(url) |>
+    req_method("GET") |>
+    req_headers(
+      "accept"          = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+      "accept-encoding" = "gzip, deflate",
+      "accept-language" = "es-ES,es;q=0.9",
+      "user-agent"      = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36",
+      "referer"         = "https://www.tripadvisor.com/Attractions-g187497-Activities-Barcelona_Catalonia.html",
+      "cookie"          = paste0("datadome=", DATADOME)
+    ) |>
+    req_error(is_error = \(resp) FALSE) |>
+    req_perform() |>
+    resp_body_string() |>
+    read_html()
+}
+
+
+# Extract metadata from card
+
+extract_meta_atr_bcn <- function(card) {
+  texts <- card |>
+    html_elements("div.biGQs.VImYz") |>
+    html_text2()
+
+  texts <- texts[!duplicated(texts)]
+  texts <- texts[!str_detect(texts, "^\\d\\.\\d$") &
+                 !str_detect(texts, "^\\(\\d[\\d,]+\\)$") &
+                 nchar(texts) <= 80]
+
+  category     <- if (length(texts) >= 1) texts[1] else NA_character_
+  raw_nb       <- if (length(texts) >= 2) texts[2] else NA_character_
+  is_nb_status <- !is.na(raw_nb) && (raw_nb %in% BOOKING_KEYS || raw_nb %in% OPEN_KEYS)
+  neighborhood <- if (is_nb_status) NA_character_ else raw_nb
+
+  rest_start <- if (is_nb_status) 2L else 3L
+  rest       <- if (length(texts) >= rest_start) texts[rest_start:length(texts)] else character(0)
+
+  open_raw    <- rest[rest %in% OPEN_KEYS | str_detect(rest, "Temporarily closed")]
+  open_status <- if (length(open_raw)) str_remove(open_raw[1], "^-\\s*") else NA_character_
+
+  booking_raw       <- rest[rest %in% BOOKING_KEYS]
+  booking_available <- if (length(booking_raw)) booking_raw[1] else NA_character_
+
+  list(
+    category          = category,
+    neighborhood      = neighborhood,
+    open_status       = open_status,
+    booking_available = booking_available
+  )
+}
+
+
+# Parse cards
+
+parse_page_atr_bcn <- function(page, global_start) {
+  cards <- page |> html_elements('[data-automation="cardWrapper"]')
+  if (length(cards) == 0) return(NULL)
+
+  lapply(seq_along(cards), function(i) {
+    card <- cards[[i]]
+
+    tracking      <- card |> html_attr("data-tracking-title")
+    attraction_id <- str_extract(tracking, "(?<=attraction_)\\d+")
+
+    name_el <- card |> html_element(".XfVdV")
+    name    <- if (!is.na(name_el)) {
+      name_el |> html_text2() |> str_remove("^\\d+\\.") |> str_trim()
+    } else NA_character_
+
+    link     <- card |> html_element("a[href*='Attraction_Review']")
+    url_raw  <- if (!is.na(link)) html_attr(link, "href") else NA_character_
+    full_url <- if (!is.na(url_raw) && !str_starts(url_raw, "http")) {
+      paste0("https://www.tripadvisor.com", url_raw)
+    } else url_raw
+
+    rating <- card |>
+      html_element('[data-automation="bubbleRatingValue"]') |>
+      html_text2() |>
+      as.numeric()
+
+    review_count <- card |>
+      html_element('[data-automation="bubbleReviewCount"]') |>
+      html_text2() |>
+      str_remove_all("[^0-9]") |>
+      as.integer()
+
+    tc_el            <- card |> html_element('[data-automation="travelersChoice-2025"]')
+    travelers_choice <- !is.na(tc_el)
+
+    desc_el     <- card |> html_element('[data-automation="listCardDescription"]')
+    description <- if (!is.na(desc_el)) html_text2(desc_el) else NA_character_
+
+    meta <- extract_meta_atr_bcn(card)
+
+    data.frame(
+      rank              = global_start + i,
+      attraction_id,
+      name,
+      category          = meta$category,
+      neighborhood      = meta$neighborhood,
+      rating,
+      review_count,
+      travelers_choice,
+      open_status       = meta$open_status,
+      booking_available = meta$booking_available,
+      description,
+      url               = full_url,
+      stringsAsFactors  = FALSE
+    )
+  }) |> bind_rows()
+}
+
+
+# Main loop
+# Upper bound of 6000 is a safe ceiling - loop stops via break when no cards are found
+
+offsets_atr_bcn      <- seq(0, 5999, by = 30)
+results_atr_bcn      <- list()
+failed_pages_atr_bcn <- c()
+global_count_bcn     <- 0
+
+message("Starting scrape...")
+
+for (i in seq_along(offsets_atr_bcn)) {
+
+  offset <- offsets_atr_bcn[i]
+  message("[", i, "] Offset ", offset)
+
+  page_html <- tryCatch(
+    get_html_atr_bcn(str_replace(URL_ATR_BCN, "\\{offset\\}", as.character(offset))),
+    error = function(e) {
+      warning("Error at offset ", offset, ": ", e$message)
+      NULL
+    }
+  )
+
+  if (!is.null(page_html)) {
+    df_page <- parse_page_atr_bcn(page_html, global_count_bcn)
+
+    if (!is.null(df_page) && nrow(df_page) > 0) {
+      results_atr_bcn[[i]] <- df_page
+      global_count_bcn     <- global_count_bcn + nrow(df_page)
+      message("  ", nrow(df_page), " attractions | Running total: ", global_count_bcn)
+    } else {
+      message("  No cards found at offset ", offset, " - stopping.")
+      break
+    }
+  } else {
+    failed_pages_atr_bcn <- c(failed_pages_atr_bcn, offset)
+  }
+
+  if (i %% 10 == 0) {
+    checkpoint <- bind_rows(results_atr_bcn)
+    write_csv(checkpoint, paste0("checkpoint_atr_bcn_", i, ".csv"), na = "")
+    message("  Checkpoint saved: ", nrow(checkpoint), " attractions")
+  }
+
+  Sys.sleep(3)
+}
+
+
+# Retry failed pages
+
+if (length(failed_pages_atr_bcn) > 0) {
+  message("Retrying ", length(failed_pages_atr_bcn), " failed pages...")
+  Sys.sleep(10)
+
+  for (offset in failed_pages_atr_bcn) {
+    message("Retrying offset ", offset)
+
+    page_html <- tryCatch(
+      get_html_atr_bcn(str_replace(URL_ATR_BCN, "\\{offset\\}", as.character(offset))),
+      error = function(e) NULL
+    )
+
+    if (!is.null(page_html)) {
+      df_page <- parse_page_atr_bcn(page_html, 0)
+      if (!is.null(df_page) && nrow(df_page) > 0) {
+        idx <- which(offsets_atr_bcn == offset)
+        results_atr_bcn[[idx]] <- df_page
+        message("  Recovered: ", nrow(df_page), " attractions")
+      }
+    }
+    Sys.sleep(5)
+  }
+}
+
+
+# Save final CSV
+
+final_catalog_atr_bcn <- bind_rows(results_atr_bcn) |>
+  distinct(attraction_id, .keep_all = TRUE) |>
+  arrange(rank)
+
+message("Total unique attractions (Barcelona): ", nrow(final_catalog_atr_bcn))
+
+write_csv(final_catalog_atr_bcn, "attractions_barcelona_tripadvisor.csv", na = "")
+message("Final CSV saved: attractions_barcelona_tripadvisor.csv")
+
+
+```
+
+## HOTELS SCRAPING
+
+### GLOBAL VARIABLES
+
+```{r}
+GRAPHQL_URL <- "https://www.tripadvisor.com/data/graphql/ids"
+QUERY_ID    <- "8351ae65c587bec7"
+SESSION_ID  <- "AB1AF37C152CBEB283C5C545FB240B1B"
+PAGEVIEW_ID <- "1e47bea2-1ef6-42aa-b0f0-b45193a63ef3"
+UA          <- "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36"
+SEC_CH_UA   <- '"Not:A-Brand";v="99", "Google Chrome";v="145", "Chromium";v="145"'
+
+
+# Build payload - generic, receives geo_id per city
+
+build_payload <- function(geo_id, offset = 0, limit = 30) {
+  toJSON(
+    list(list(
+      extensions = list(preRegisteredQueryId = QUERY_ID),
+      variables  = list(
+        geoId                              = geo_id,
+        blenderId                          = NULL,
+        boundingBox                        = NULL,
+        centerAndRadius                    = NULL,
+        travelInfo                         = NULL,
+        clientType                         = "DESKTOP",
+        currency                           = "USD",
+        filters                            = list(
+          amenities                        = NULL,
+          brands                           = NULL,
+          classes                          = NULL,
+          styles                           = NULL,
+          hoteltypes                       = NULL,
+          categories                       = NULL,
+          hotelowners                      = NULL,
+          anyTags                          = NULL,
+          selectSpecialOffers              = NULL,
+          selectFreeCancelation            = NULL,
+          selectPayAtStay                  = NULL,
+          selectTravelersChoiceWinner      = FALSE,
+          selectTravelersChoiceBOTBWinner  = FALSE,
+          neighborhoodsOrNear              = NULL,
+          distanceFrom                     = NULL,
+          minRating                        = NULL,
+          priceRange                       = NULL,
+          sourceXSellShelfType             = NULL
+        ),
+        includePhotoSizes                  = FALSE,
+        isDiscoEligible                    = TRUE,
+        limit                              = limit,
+        loadLocationInfoData               = FALSE,
+        loadLocationSEOData                = TRUE,
+        loadMapSpecificData                = FALSE,
+        loadNearbyPointOfInterestPlaceType = FALSE,
+        loadPoiThumbnail                   = FALSE,
+        loadReviewSubratingAvgs            = FALSE,
+        metaMarketingQueryString           = "",
+        offset                             = offset,
+        pageviewId                         = PAGEVIEW_ID,
+        polling                            = FALSE,
+        pricingMode                        = NULL,
+        productId                          = "Hotels",
+        requestNumber                      = 1,
+        resolveGeoIdFromBoundingBox        = FALSE,
+        route                              = list(
+          page   = "HotelsFusion",
+          params = list(
+            geoId       = geo_id,
+            contentType = "hotel",
+            webVariant  = "HotelsFusion"
+          )
+        ),
+        sessionId                          = SESSION_ID,
+        showContextualisedThumbnail        = FALSE,
+        sort                               = "BEST_VALUE",
+        tertiaryOffers                     = FALSE,
+        userEngagedFilters                 = FALSE,
+        viewType                           = "LIST"
+      )
+    )),
+    auto_unbox = TRUE,
+    null = "null"
+  )
+}
+
+
+# Fetch page - generic, receives url, cookies, referer and geo_id per city
+
+fetch_page <- function(geo_id, url, cookies, referer, offset = 0, limit = 30) {
+  raw <- request(url) |>
+    req_method("POST") |>
+    req_headers(
+      "accept"             = "*/*",
+      "accept-encoding"    = "gzip, deflate",
+      "content-type"       = "application/json",
+      "cookie"             = cookies,
+      "origin"             = "https://www.tripadvisor.com",
+      "referer"            = referer,
+      "user-agent"         = UA,
+      "sec-ch-ua"          = SEC_CH_UA,
+      "sec-ch-ua-mobile"   = "?0",
+      "sec-ch-ua-platform" = '"macOS"',
+      "sec-fetch-dest"     = "empty",
+      "sec-fetch-mode"     = "same-origin",
+      "sec-fetch-site"     = "same-origin"
+    ) |>
+    req_body_raw(build_payload(geo_id, offset, limit), type = "application/json") |>
+    req_error(is_error = \(resp) FALSE) |>
+    req_perform() |>
+    resp_body_string()
+
+  if (grepl('"errors"', raw) && !grepl('"results"', raw)) {
+    warning("Server error at offset ", offset, ": ", substr(raw, 1, 200))
+    return(NULL)
+  }
+
+  json <- fromJSON(raw, flatten = TRUE)
+  json[[1]][[1]]
+}
+
+
+# Parse results - generic, receives ranking column name per city
+
+parse_results <- function(df, ranking_col) {
+  out <- data.frame(
+    location_id   = df$locationId,
+    name          = df$location.locationV2.names.name,
+    stars         = df$location.detail.hotel.providerStarRating,
+    rating        = df$location.reviewSummary.rating,
+    num_reviews   = df$location.reviewSummary.count,
+    ranking       = df$location.locationV2.hotelHierarchicalPopIndex.localizedCategoryPopIndexString,
+    price_min_usd = df$location.locationV2.hotelPriceRanges.minimum,
+    price_max_usd = df$location.locationV2.hotelPriceRanges.maximum,
+    price_lowest  = df$resultDetail.hotelMetaResult.lowestPrice,
+    address       = df$location.locationV2.contact.streetAddress.fullAddress,
+    phone         = df$location.locationV2.contact.telephone,
+    latitude      = df$location.locationV2.geocode.latitude,
+    longitude     = df$location.locationV2.geocode.longitude,
+    category      = df$location.accommodationCategory,
+    url           = paste0("https://www.tripadvisor.com", df$location.url),
+    stringsAsFactors = FALSE
+  )
+  names(out)[names(out) == "ranking"] <- ranking_col
+  out
+}
+```
+
+
+### COOKIE SETUP
+
+```{r}
+COOKIES <- "TAUnique=%1%enc%3AEj%2F6b5o4JziYJweRXYy%2Bh4x4W2Wf2iJSzb7imUk5mTryDAUevAi1%2BgAAOK5gJCdQNox8JbUSTxk%3D; TASID=AB1AF37C152CBEB283C5C545FB240B1B; TASession=V2ID.AB1AF37C152CBEB283C5C545FB240B1B*SQ.1*LS.Hotels*HS.recommended*ES.popularity*DS.5*SAS.popularity*FPS.oldFirst*FA.1*DF.0*TRA.true; TASSK=enc%3AAMdUa2dd%2B%2BfqT3lxU88U19T2ZxU1NzFSAN4sCAa1ajKXP7UBsQMcCeLJAv2%2BuNKaPIDzycybLoodE2VkzkvBhRCcT%2F1lOi06cGaKJ4AiqTDVHR1FNOzMiffSY6rawqzXtA%3D%3D; datadome=6i8zI2WGFmYOptncIjObyq5XdhRHKQe76I~632XrQk0rcF6f22id~aZAtCfBKrlVqn6hlyn9UfohNiSpAAguymItQ9WbKl5bbUTHTRhXJvG7cEjGxLDZVC1eVUaQqcdq"
+```
+
+### MADRID HOTELS
+
+```{r}
+GEO_ID_MAD  <- 187514
+TOTAL_MAD   <- 2289
+REFERER_MAD <- "https://www.tripadvisor.com/Hotels-g187514-Madrid-Hotels.html"
+
+offsets_mad <- seq(0, TOTAL_MAD - 1, by = 30)
+results_mad <- list()
+
+message("Starting scrape Madrid: ", length(offsets_mad), " pages")
+
+for (i in seq_along(offsets_mad)) {
+
+  offset <- offsets_mad[i]
+  message("[", i, "/", length(offsets_mad), "] Offset ", offset)
+
+  raw_df <- tryCatch(
+    fetch_page(GEO_ID_MAD, GRAPHQL_URL, COOKIES, REFERER_MAD, offset),
+    error = function(e) { warning("Error at offset ", offset, ": ", e$message); NULL }
+  )
+
+  if (!is.null(raw_df) && nrow(raw_df) > 0) {
+    results_mad[[i]] <- parse_results(raw_df, "ranking_madrid")
+    message("  ", nrow(results_mad[[i]]), " hotels | Running total: ",
+            sum(sapply(results_mad, function(x) if (!is.null(x)) nrow(x) else 0)))
+  } else {
+    message("  No results at offset ", offset)
+  }
+
+  if (i %% 10 == 0) {
+    checkpoint <- bind_rows(results_mad)
+    write_csv(checkpoint, paste0("checkpoint_htl_mad_", i, ".csv"), na = "")
+    message("  Checkpoint saved: ", nrow(checkpoint), " hotels")
+  }
+
+  Sys.sleep(3)
+}
+
+final_catalog_htl_mad <- bind_rows(results_mad) |>
+  distinct(location_id, .keep_all = TRUE) |>
+  arrange(location_id)
+
+message("Total unique hotels (Madrid): ", nrow(final_catalog_htl_mad))
+write_csv(final_catalog_htl_mad, "hotels_madrid_tripadvisor.csv", na = "")
+message("Final CSV saved: hotels_madrid_tripadvisor.csv")
+```
+
+SEVILLE HOTELS
+
+```{r}
+GEO_ID_SEV  <- 187443
+TOTAL_SEV   <- 1036
+REFERER_SEV <- "https://www.tripadvisor.com/Hotels-g187443-Seville_Province_of_Seville_Andalucia-Hotels.html"
+
+offsets_sev <- seq(0, TOTAL_SEV - 1, by = 30)
+results_sev <- list()
+
+message("Starting scrape Seville: ", length(offsets_sev), " pages")
+
+for (i in seq_along(offsets_sev)) {
+
+  offset <- offsets_sev[i]
+  message("[", i, "/", length(offsets_sev), "] Offset ", offset)
+
+  raw_df <- tryCatch(
+    fetch_page(GEO_ID_SEV, GRAPHQL_URL, COOKIES, REFERER_SEV, offset),
+    error = function(e) { warning("Error at offset ", offset, ": ", e$message); NULL }
+  )
+
+  if (!is.null(raw_df) && nrow(raw_df) > 0) {
+    results_sev[[i]] <- parse_results(raw_df, "ranking_seville")
+    message("  ", nrow(results_sev[[i]]), " hotels | Running total: ",
+            sum(sapply(results_sev, function(x) if (!is.null(x)) nrow(x) else 0)))
+  } else {
+    message("  No results at offset ", offset)
+  }
+
+  if (i %% 10 == 0) {
+    checkpoint <- bind_rows(results_sev)
+    write_csv(checkpoint, paste0("checkpoint_htl_sev_", i, ".csv"), na = "")
+    message("  Checkpoint saved: ", nrow(checkpoint), " hotels")
+  }
+
+  Sys.sleep(3)
+}
+
+final_catalog_htl_sev <- bind_rows(results_sev) |>
+  distinct(location_id, .keep_all = TRUE) |>
+  arrange(location_id)
+
+message("Total unique hotels (Seville): ", nrow(final_catalog_htl_sev))
+write_csv(final_catalog_htl_sev, "hotels_seville_tripadvisor.csv", na = "")
+message("Final CSV saved: hotels_seville_tripadvisor.csv")
+
+```
+### BARCELONA
+
+```{r}
+GEO_ID_BCN  <- 187497
+TOTAL_BCN   <- 2354
+REFERER_BCN <- "https://www.tripadvisor.com/Hotels-g187497-Barcelona_Catalonia-Hotels.html"
+
+offsets_bcn <- seq(0, TOTAL_BCN - 1, by = 30)
+results_bcn <- list()
+
+message("Starting scrape Barcelona: ", length(offsets_bcn), " pages")
+
+for (i in seq_along(offsets_bcn)) {
+
+  offset <- offsets_bcn[i]
+  message("[", i, "/", length(offsets_bcn), "] Offset ", offset)
+
+  raw_df <- tryCatch(
+    fetch_page(GEO_ID_BCN, GRAPHQL_URL, COOKIES, REFERER_BCN, offset),
+    error = function(e) { warning("Error at offset ", offset, ": ", e$message); NULL }
+  )
+
+  if (!is.null(raw_df) && nrow(raw_df) > 0) {
+    results_bcn[[i]] <- parse_results(raw_df, "ranking_barcelona")
+    message("  ", nrow(results_bcn[[i]]), " hotels | Running total: ",
+            sum(sapply(results_bcn, function(x) if (!is.null(x)) nrow(x) else 0)))
+  } else {
+    message("  No results at offset ", offset)
+  }
+
+  if (i %% 10 == 0) {
+    checkpoint <- bind_rows(results_bcn)
+    write_csv(checkpoint, paste0("checkpoint_htl_bcn_", i, ".csv"), na = "")
+    message("  Checkpoint saved: ", nrow(checkpoint), " hotels")
+  }
+
+  Sys.sleep(3)
+}
+
+final_catalog_htl_bcn <- bind_rows(results_bcn) |>
+  distinct(location_id, .keep_all = TRUE) |>
+  arrange(location_id)
+
+message("Total unique hotels (Barcelona): ", nrow(final_catalog_htl_bcn))
+write_csv(final_catalog_htl_bcn, "hotels_barcelona_tripadvisor.csv", na = "")
+message("Final CSV saved: hotels_barcelona_tripadvisor.csv")
+
+```
+
